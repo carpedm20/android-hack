@@ -190,13 +190,8 @@ start_emulator() {
         die "AVD '$AVD_NAME' not found. Run patch_pairip.sh first to create it."
     fi
 
-    # Save snapshot and kill any existing emulator before starting a new one.
-    # adb may not detect the emulator (offline/stale), so also kill by process.
-    if "$ADB" shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; then
-        log "Saving emulator snapshot (preserving login state)..."
-        "$ADB" emu avd snapshot save default_boot &>/dev/null || true
-        sleep 2
-    fi
+    # Kill any existing emulator (adb emu kill triggers automatic quickboot save).
+    # Also kill by process in case adb can't reach it.
     "$ADB" emu kill &>/dev/null || true
     pkill -f "qemu-system.*${AVD_NAME}" 2>/dev/null || true
     sleep 3

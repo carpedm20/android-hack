@@ -502,6 +502,48 @@ cp "$ORIG_FLUTTER" "$WORK_DIR/orig_flutter/lib/arm64-v8a/libflutter.so"
 cp "$STOCK_DIR/lib/arm64-v8a/libflutter.so" "$ORIG_FLUTTER"
 log "Replaced libflutter.so with stock engine (${FLUTTER_ENGINE_COMMIT:0:12})"
 
+# 7b. Patch BoringSSL in libflutter.so to disable SSL certificate verification.
+# Flutter uses its own BoringSSL (not Android's system CA store), so mitmproxy's
+# CA cert installed in /system/etc/security/cacerts is ignored.
+# We patch ssl_verify_peer_cert and ssl_reverify_peer_cert to return 0 (ssl_verify_ok).
+log "Patching BoringSSL SSL verification in libflutter.so..."
+python3 << 'PYEOF'
+import struct, subprocess, sys
+
+flutter_so = "$ORIG_FLUTTER"
+
+# Find function offsets from symbol table
+result = subprocess.run(["nm", flutter_so], capture_output=True, text=True, timeout=300)
+symbols = {}
+for line in result.stdout.splitlines():
+    parts = line.strip().split()
+    if len(parts) >= 3:
+        addr, typ, name = parts[0], parts[1], parts[2]
+        if "ssl_verify_peer_cert" in name or "ssl_reverify_peer_cert" in name:
+            symbols[name] = int(addr, 16)
+
+if not symbols:
+    print("  WARNING: ssl_verify_peer_cert symbols not found — SSL bypass skipped")
+    sys.exit(0)
+
+# ARM64: mov w0, #0 ; ret
+patch = struct.pack('<II', 0x52800000, 0xD65F03C0)
+
+with open(flutter_so, "r+b") as f:
+    for name, offset in sorted(symbols.items()):
+        f.seek(offset)
+        original = f.read(8)
+        f.seek(offset)
+        f.write(patch)
+        short_name = name.split("::")[-1] if "::" in name else name
+        # Demangle: extract just the function name
+        for part in ["_ZN4bssl20", "_ZN4bssl22", "EPNS_13SSL_HANDSHAKEEb", "EPNS_13SSL_HANDSHAKEE"]:
+            short_name = short_name.replace(part, "")
+        print(f"  Patched {short_name} at 0x{offset:x} (mov w0,#0; ret)")
+
+print("  BoringSSL SSL verification disabled — mitmproxy can intercept Flutter HTTPS")
+PYEOF
+
 # ============================================================================
 # Step 8: Disable PairIP Java components
 # ============================================================================
