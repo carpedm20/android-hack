@@ -190,6 +190,17 @@ start_emulator() {
         die "AVD '$AVD_NAME' not found. Run patch_pairip.sh first to create it."
     fi
 
+    # Save snapshot and kill any existing emulator before starting a new one.
+    # adb may not detect the emulator (offline/stale), so also kill by process.
+    if "$ADB" shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; then
+        log "Saving emulator snapshot (preserving login state)..."
+        "$ADB" emu avd snapshot save default_boot &>/dev/null || true
+        sleep 2
+    fi
+    "$ADB" emu kill &>/dev/null || true
+    pkill -f "qemu-system.*${AVD_NAME}" 2>/dev/null || true
+    sleep 3
+
     # Clean stale locks
     rm -f "$HOME/.android/avd/${AVD_NAME}.avd/"*.lock 2>/dev/null || true
 
@@ -241,12 +252,7 @@ else
     fi
 
     if $NEED_RESTART; then
-        log "Saving emulator snapshot before proxy toggle..."
-        "$ADB" emu avd snapshot save default_boot &>/dev/null || true
-        sleep 3
         log "Restarting emulator to toggle proxy..."
-        "$ADB" emu kill &>/dev/null || true
-        sleep 5
         start_emulator
     else
         log "Emulator already running (proxy state matches)"
