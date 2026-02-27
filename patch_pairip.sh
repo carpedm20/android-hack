@@ -425,7 +425,7 @@ log "Decompiled to $DECOMPILED"
 # Auto-detect package name and main activity from AndroidManifest.xml
 MANIFEST="$DECOMPILED/AndroidManifest.xml"
 PACKAGE=$(grep -o 'package="[^"]*"' "$MANIFEST" | head -1 | sed 's/package="//;s/"//')
-MAIN_ACTIVITY=$(grep -B10 'android.intent.action.MAIN' "$MANIFEST" | grep -o 'android:name="[^"]*"' | tail -1 | sed 's/android:name="//;s/"//')
+MAIN_ACTIVITY=$(grep -B10 'android.intent.action.MAIN' "$MANIFEST" | grep '<activity ' | grep -o 'android:name="[^"]*"' | head -1 | sed 's/android:name="//;s/"//')
 log "Package: $PACKAGE"
 log "Main activity: $MAIN_ACTIVITY"
 
@@ -596,6 +596,16 @@ with open('$COREFACTORY', 'w') as f:
     log "  CoreComponentFactory: clinit cleared"
 fi
 
+# 8e. Fix GeneratedPluginRegistrant catch clauses
+# The auto-generated plugin registrant catches Exception but broken plugins throw
+# Errors (NoClassDefFoundError, ExceptionInInitializerError) which extend Error, not Exception.
+# Change all catch clauses to catch Throwable so the registration chain doesn't abort.
+GPR=$(find "$DECOMPILED" -path "*/flutter/plugins/GeneratedPluginRegistrant.smali" | head -1)
+if [ -n "$GPR" ] && [ -f "$GPR" ]; then
+    sed -i '' 's/\.catch Ljava\/lang\/Exception;/.catch Ljava\/lang\/Throwable;/g' "$GPR"
+    log "  GeneratedPluginRegistrant: catch clauses widened to Throwable"
+fi
+
 # ============================================================================
 # Step 9: Disable crash-prone ContentProviders
 # ============================================================================
@@ -739,6 +749,37 @@ vault_pattern = re.compile(
     r'sget-object\s+(\w+),\s+(L\S+;)->(\w+):Ljava/lang/String;'
 )
 
+def find_smali_file(cls_desc, decompiled_dir):
+    """Find the smali file for a class descriptor, verifying the class declaration matches.
+    Handles dotted directory variants (e.g., yi.1/h.smali) and case-insensitive filesystems."""
+    cls_path = cls_desc[1:-1] + ".smali"  # Lyi/h; -> yi/h.smali
+    parts = cls_path.split('/')
+    # Generate candidate paths: original + dotted variants for each directory level
+    # Apktool uses .1 suffix on directory names to resolve case conflicts (e.g., yi/ vs Yi/ -> yi.1/)
+    candidates_rel = [cls_path]
+    for k in range(len(parts)-1):
+        # Append .1 to the k-th directory component
+        dotted_parts = list(parts)
+        dotted_parts[k] = dotted_parts[k] + '.1'
+        candidates_rel.append('/'.join(dotted_parts))
+    for sd in sorted(glob.glob(os.path.join(decompiled_dir, "smali*"))):
+        for crel in candidates_rel:
+            candidate = os.path.join(sd, crel)
+            if os.path.exists(candidate):
+                # Verify the class descriptor matches (important on case-insensitive FS)
+                try:
+                    with open(candidate) as f:
+                        first_line = ''
+                        for fline in f:
+                            if fline.strip().startswith('.class'):
+                                first_line = fline
+                                break
+                    if cls_desc in first_line:
+                        return candidate
+                except:
+                    pass
+    return None
+
 # Map of known reflection call patterns -> how to find the correct value
 # We look for patterns where a vault field is loaded then used in a reflection call
 patches = {}  # (class_desc, field_name) -> correct_value
@@ -774,49 +815,90 @@ for fpath in all_smali:
         if 'AtomicIntegerFieldUpdater;->newUpdater' in context or \
            'AtomicLongFieldUpdater;->newUpdater' in context or \
            'AtomicReferenceFieldUpdater;->newUpdater' in context:
-            # The class is usually loaded with const-class just before
-            for j in range(max(0, i-5), i):
+            is_long = 'AtomicLongFieldUpdater;->newUpdater' in context
+            is_int = 'AtomicIntegerFieldUpdater;->newUpdater' in context
+            # The const-class may be far back (reused across many updaters in <clinit>)
+            # Search up to 200 lines back
+            target_cls = None
+            for j in range(max(0, i-200), i):
+                cm = re.search(r'const-class\s+\w+,\s+(L\S+;)', lines[j])
+                if cm:
+                    target_cls = cm.group(1)  # keep last one found before our line
+            if target_cls:
+                target_file = find_smali_file(target_cls, decompiled)
+                if target_file:
+                    with open(target_file) as tf:
+                        tc = tf.read()
+                    # Find ALL volatile fields of the right type
+                    if is_long or is_int:
+                        vol_fields = re.findall(r'\.field\s+\w+\s+volatile\s+\w*\s*(\w+\$volatile):J', tc)
+                    else:
+                        vol_fields = re.findall(r'\.field\s+\w+\s+volatile\s+\w*\s*(\w+\$volatile):L', tc)
+                    if not vol_fields:
+                        # Try without $volatile suffix
+                        if is_long or is_int:
+                            vol_fields = re.findall(r'\.field\s+\w+\s+volatile\s+\w*\s*(\w+):J', tc)
+                        else:
+                            vol_fields = re.findall(r'\.field\s+\w+\s+volatile\s+\w*\s*(\w+):L', tc)
+                    # Find which volatile fields are already used by hardcoded const-string in this file
+                    # Scan the same <clinit> method for const-string values that match volatile field names
+                    clinit_start = None
+                    clinit_end = None
+                    for li, ln in enumerate(lines):
+                        if '<clinit>' in ln:
+                            clinit_start = li
+                        if clinit_start and '.end method' in ln and li > clinit_start:
+                            clinit_end = li
+                            break
+                    hardcoded_fields = set()
+                    if clinit_start is not None and clinit_end is not None:
+                        for li in range(clinit_start, clinit_end):
+                            csm = re.search(r'const-string\s+\w+,\s+"([^"]+)"', lines[li])
+                            if csm:
+                                hardcoded_fields.add(csm.group(1))
+                    # The correct field is the one NOT already hardcoded
+                    remaining = [f for f in vol_fields if f not in hardcoded_fields]
+                    if len(remaining) == 1:
+                        patches[(cls, field)] = remaining[0]
+                    elif len(remaining) > 1:
+                        # Multiple remaining — try the first one as best guess
+                        patches[(cls, field)] = remaining[0]
+                    elif vol_fields:
+                        # All seem hardcoded? Just use first volatile field as fallback
+                        patches[(cls, field)] = vol_fields[0]
+
+        # Class.getDeclaredMethod / getMethod — vault string is the method name
+        elif 'getDeclaredMethod' in context or 'getMethod' in context:
+            # Find const-class for the target class (loaded before the vault field)
+            target_cls = None
+            for j in range(max(0, i-8), i):
                 cm = re.search(r'const-class\s+\w+,\s+(L\S+;)', lines[j])
                 if cm:
                     target_cls = cm.group(1)
-                    # Find the volatile field in that class
-                    target_file = None
-                    target_cls_path = target_cls[1:-1] + ".smali"
-                    for sd in sorted(glob.glob(os.path.join(decompiled, "smali*"))):
-                        candidate = os.path.join(sd, target_cls_path)
-                        if os.path.exists(candidate):
-                            target_file = candidate
-                            break
-                    if target_file:
-                        with open(target_file) as tf:
-                            tc = tf.read()
-                        vol_match = re.search(r'\.field\s+\w+\s+volatile\s+\w*\s*(\w+):', tc)
-                        if vol_match:
-                            patches[(cls, field)] = vol_match.group(1)
+            # Find parameter class types (in filled-new-array after the vault field)
+            param_types = []
+            for j in range(i+1, min(i+8, len(lines))):
+                pm = re.search(r'const-class\s+\w+,\s+(L\S+;)', lines[j])
+                if pm:
+                    param_types.append(pm.group(1))
+                if 'getDeclaredMethod' in lines[j] or 'getMethod' in lines[j]:
                     break
-
-        # Class.forName
-        elif 'Class;->forName' in context:
-            # Need to figure out what class name should be here
-            # Look for clues in surrounding code
-            pass
-
-        # Class.getMethod / getDeclaredMethod
-        elif 'getMethod' in context or 'getDeclaredMethod' in context:
-            pass
-
-    # Also check for loadClass patterns
-    for i, line in enumerate(lines):
-        m = vault_pattern.search(line)
-        if not m:
-            continue
-        reg, cls, field = m.group(1), m.group(2), m.group(3)
-        if cls not in vault_classes:
-            continue
-        context = ''.join(lines[i:i+10])
-        if 'loadClass' in context or 'Class;->forName' in context:
-            # These are class name strings - harder to auto-detect
-            pass
+            if target_cls:
+                # Search the target class for a method matching the parameter types
+                candidate = find_smali_file(target_cls, decompiled)
+                if candidate:
+                    with open(candidate) as tf:
+                        tc = tf.read()
+                    # Find methods and match by param count/types
+                    for mm in re.finditer(r'\.method\s+\w+.*?\s+(\w+)\(([^)]*)\)', tc):
+                        mname = mm.group(1)
+                        mparams = mm.group(2)
+                        # Simple match: same number of class params
+                        param_cls = re.findall(r'L[^;]+;', mparams)
+                        if len(param_cls) == len(param_types) and len(param_types) > 0:
+                            if all(p == e for p, e in zip(param_cls, param_types)):
+                                patches[(cls, field)] = mname
+                                break
 
 # Known critical strings that appear across all versions
 # These are the actual Java/Android API strings that must be correct
@@ -842,6 +924,48 @@ KNOWN_STRINGS = {
 print(f"  Auto-detected {len(patches)} vault strings from reflection analysis")
 for (cls, field), value in sorted(patches.items()):
     print(f"    {field} = \"{value}\"")
+
+# Match KNOWN_STRINGS by scanning all vault field usages to find which field
+# corresponds to which known string value (by analyzing the call context)
+# This catches cases the auto-detection above missed.
+for fpath in all_smali:
+    try:
+        with open(fpath) as f:
+            lines = f.readlines()
+    except:
+        continue
+    for i, line in enumerate(lines):
+        m = vault_pattern.search(line)
+        if not m:
+            continue
+        reg, cls, field = m.group(1), m.group(2), m.group(3)
+        if cls not in vault_classes:
+            continue
+        if (cls, field) in patches:
+            continue
+        # Look ahead for known API patterns
+        context = ''.join(lines[i:i+15])
+        # getDeclaredMethod on Handler with Looper param -> "createAsync"
+        if 'android/os/Handler' in context and 'getDeclaredMethod' in context and 'android/os/Looper' in context:
+            patches[(cls, field)] = "createAsync"
+        # Class.forName patterns
+        elif 'Class;->forName' in context:
+            for known in KNOWN_STRINGS:
+                if '.' in known and known[0].islower():  # looks like a class name
+                    # Check if there's a string hint nearby
+                    if known.split('.')[-1].lower() in context.lower():
+                        patches[(cls, field)] = known
+                        break
+        # getDeclaredField/getField patterns — the vault string is the field name
+        elif 'getDeclaredField' in context or 'getField(' in context:
+            for known in KNOWN_STRINGS:
+                if '.' not in known and known[0].islower():
+                    pass  # handled by AtomicFieldUpdater detection above
+        # loadClass patterns
+        elif 'loadClass' in context:
+            for known in KNOWN_STRINGS:
+                if '.' in known and known[0] not in 'abcdefghijklmnopqrstuvwxyz':
+                    pass  # class names starting with uppercase package
 
 # Now scan vault class smali files and patch const-strings
 total_patched = 0
@@ -1288,6 +1412,115 @@ print(f"  Neutralized Embrace SDK in {patched} files")
 PYEOF
 export DECOMPILED
 
+# 13d. Stub out broken Flutter plugin MethodChannel handlers
+# Plugins like Embrace fail to register because their native SDK init is broken.
+# This causes MissingPluginException on the Dart side, which can block app startup.
+# We find EmbracePlugin (and similar) and replace onMethodCall with result.success(null).
+python3 << 'PYEOF'
+import os, re, glob
+
+decompiled = os.environ.get("DECOMPILED", "/tmp/pairip_patch/decompiled")
+patched = 0
+
+# Find Flutter plugin classes that have onMethodCall and reference broken SDKs
+# EmbracePlugin is the primary one - it registers "embrace" channel
+for smali_dir in sorted(glob.glob(os.path.join(decompiled, "smali*"))):
+    for root, dirs, files in os.walk(smali_dir):
+        for fname in files:
+            if not fname.endswith(".smali"):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+            except:
+                continue
+
+            # Look for Embrace Flutter plugin class
+            if 'embrace_android' not in content and 'EmbracePlugin' not in content:
+                continue
+            if 'onMethodCall' not in content:
+                continue
+            if '.implements Ldf/b;' not in content:  # FlutterPlugin interface
+                continue
+
+            # Replace the ENTIRE EmbracePlugin class with a clean stub
+            # The original class can cause VerifyError if partially patched
+            # Extract the class name, interfaces, and field info to create a minimal stub
+            cls_match = re.search(r'^\.class\s+.*\s+(L\S+;)', content, re.MULTILINE)
+            cls_desc = cls_match.group(1) if cls_match else 'LVe/a;'
+
+            # Find instance field declarations for K (MethodChannel) and L (Context)
+            field_k = re.search(r'\.field public (\w+):Lhf/r;', content)
+            field_l = re.search(r'\.field public (\w+):Landroid/content/Context;', content)
+            fname_k = field_k.group(1) if field_k else 'K'
+            fname_l = field_l.group(1) if field_l else 'L'
+
+            stub_class = f""".class public final {cls_desc}
+.super Ljava/lang/Object;
+
+.implements Ldf/b;
+.implements Lhf/p;
+
+.field public {fname_k}:Lhf/r;
+.field public {fname_l}:Landroid/content/Context;
+
+.method public constructor <init>()V
+    .locals 0
+    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+.method public static a(Lhf/n;Ljava/lang/String;)Z
+    .locals 1
+    const/4 v0, 0x0
+    return v0
+.end method
+
+.method public final onAttachedToEngine(Ldf/a;)V
+    .locals 3
+
+    :try_start_0
+    new-instance v0, Lhf/r;
+    iget-object v1, p1, Ldf/a;->c:Lhf/f;
+    const-string v2, "embrace"
+    invoke-direct {{v0, v1, v2}}, Lhf/r;-><init>(Lhf/f;Ljava/lang/String;)V
+    iput-object v0, p0, {cls_desc}->{fname_k}:Lhf/r;
+    invoke-virtual {{v0, p0}}, Lhf/r;->b(Lhf/p;)V
+    iget-object p1, p1, Ldf/a;->a:Landroid/content/Context;
+    iput-object p1, p0, {cls_desc}->{fname_l}:Landroid/content/Context;
+    :try_end_0
+    .catch Ljava/lang/Throwable; {{:try_start_0 .. :try_end_0}} :catch_0
+    :catch_0
+
+    return-void
+.end method
+
+.method public final onDetachedFromEngine(Ldf/a;)V
+    .locals 0
+    return-void
+.end method
+
+.method public final onMethodCall(Lhf/n;Lhf/q;)V
+    .locals 1
+
+    const/4 v0, 0x0
+    invoke-interface {{p2, v0}}, Lhf/q;->success(Ljava/lang/Object;)V
+
+    return-void
+.end method
+"""
+            with open(fpath, 'w') as f:
+                f.write(stub_class)
+            patched += 1
+            print(f"  Replaced EmbracePlugin ({os.path.basename(fpath)}) with clean stub class")
+
+if patched > 0:
+    print(f"  Stubbed {patched} broken plugin MethodChannel handlers")
+else:
+    print(f"  No broken plugin handlers found to stub")
+PYEOF
+
 # ============================================================================
 # Step 14: Patch remaining crash sources (Snowplow, SecureStorage, MethodChannels)
 # ============================================================================
@@ -1623,6 +1856,167 @@ print(f"  Patched {patched} cipher-dependent methods with null-guard try-catch")
 PYEOF
 export DECOMPILED
 
+# 14d. Stub FlutterSecureStorage plugin to return success(null) for all calls.
+# EncryptedSharedPreferences fails because the Tink cipher algorithm name is an empty
+# vault string, causing NoSuchAlgorithmException. The Dart code awaits SecureStorage reads
+# and may hang if the native side sends an error. By returning null for reads and
+# success for writes, the Dart code thinks there's no stored data and proceeds normally.
+log "Stubbing FlutterSecureStorage plugin..."
+SECURE_STORAGE_PLUGIN=$(find "$DECOMPILED" -name "c.smali" -path "*/X7/*" | head -1)
+if [ -z "$SECURE_STORAGE_PLUGIN" ]; then
+    # Find by channel name pattern
+    SECURE_STORAGE_PLUGIN=$(grep -rl "flutter_secure_storage" "$DECOMPILED"/smali* 2>/dev/null | grep '\.smali$' | head -1)
+fi
+if [ -n "$SECURE_STORAGE_PLUGIN" ] && [ -f "$SECURE_STORAGE_PLUGIN" ]; then
+    export SECURE_STORAGE_PLUGIN
+    python3 << 'PYEOF'
+import os, re
+
+fpath = os.environ["SECURE_STORAGE_PLUGIN"]
+with open(fpath) as f:
+    content = f.read()
+
+# Find the class descriptor
+cls_m = re.search(r'^\.class\s+.*\s+(L\S+;)', content, re.MULTILINE)
+if not cls_m:
+    print("  Could not find class descriptor in FlutterSecureStorage plugin")
+    exit(0)
+
+cls_desc = cls_m.group(1)
+
+# Replace onMethodCall to immediately return success(null)
+# The method signature: public final onMethodCall(Lhf/n;Lhf/q;)V
+# p1 = MethodCall, p2 = MethodChannel.Result
+# We need to find the Result interface's success method name
+# From previous analysis: Lhf/q; has success(Ljava/lang/Object;)V
+
+# Find onMethodCall with any parameter types
+old_method_re = re.compile(
+    r'\.method\s+public\s+(?:final\s+)?onMethodCall\((L\S+;)(L\S+;)\)V.*?\.end method',
+    re.DOTALL
+)
+
+m = old_method_re.search(content)
+if m:
+    call_type = m.group(1)
+    result_type = m.group(2)
+    new_method = f""".method public final onMethodCall({call_type}{result_type})V
+    .locals 1
+    # Stub: return success(null) for all calls
+    const/4 v0, 0x0
+    invoke-interface {{p2, v0}}, {result_type}->success(Ljava/lang/Object;)V
+    return-void
+.end method"""
+
+    content = old_method_re.sub(new_method, content, count=1)
+    with open(fpath, 'w') as f:
+        f.write(content)
+    print(f"  Stubbed FlutterSecureStorage onMethodCall -> success(null)")
+else:
+    print(f"  Could not find onMethodCall in FlutterSecureStorage plugin")
+PYEOF
+else
+    log "  FlutterSecureStorage plugin not found (skipping)"
+fi
+
+# 14e. Patch vault strings used with Context.getSystemService().
+# PairIP encrypts Android service name strings (e.g. "connectivity") used in
+# getSystemService() calls. When empty, getSystemService returns null, causing NPE.
+# We auto-detect the service name from the check-cast type that follows.
+log "Patching getSystemService vault strings..."
+python3 << 'PYEOF'
+import os, re, glob
+
+# Android service class -> service name mapping
+SERVICE_MAP = {
+    "Landroid/net/ConnectivityManager;": "connectivity",
+    "Landroid/net/wifi/WifiManager;": "wifi",
+    "Landroid/app/NotificationManager;": "notification",
+    "Landroid/location/LocationManager;": "location",
+    "Landroid/telephony/TelephonyManager;": "phone",
+    "Landroid/media/AudioManager;": "audio",
+    "Landroid/os/PowerManager;": "power",
+    "Landroid/app/AlarmManager;": "alarm",
+    "Landroid/view/WindowManager;": "window",
+    "Landroid/view/LayoutInflater;": "layout_inflater",
+    "Landroid/app/ActivityManager;": "activity",
+    "Landroid/os/Vibrator;": "vibrator",
+    "Landroid/app/KeyguardManager;": "keyguard",
+    "Landroid/hardware/SensorManager;": "sensor",
+    "Landroid/view/inputmethod/InputMethodManager;": "input_method",
+    "Landroid/app/UiModeManager;": "uimode",
+    "Landroid/app/DownloadManager;": "download",
+    "Landroid/os/BatteryManager;": "batterymanager",
+    "Landroid/app/job/JobScheduler;": "jobscheduler",
+    "Landroid/hardware/display/DisplayManager;": "display",
+    "Landroid/hardware/camera2/CameraManager;": "camera",
+    "Landroid/view/accessibility/AccessibilityManager;": "accessibility",
+    "Landroid/bluetooth/BluetoothManager;": "bluetooth",
+    "Landroid/content/ClipboardManager;": "clipboard",
+    "Landroid/app/AppOpsManager;": "appops",
+}
+
+decompiled = os.environ.get("DECOMPILED", "/tmp/pairip_patch/decompiled")
+patched = 0
+
+for smali_dir in sorted(glob.glob(os.path.join(decompiled, "smali*"))):
+    for root, dirs, files in os.walk(smali_dir):
+        for fname in files:
+            if not fname.endswith('.smali'):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath) as f:
+                    lines = f.readlines()
+            except:
+                continue
+
+            modified = False
+            for i, line in enumerate(lines):
+                if 'getSystemService(Ljava/lang/String;)' not in line:
+                    continue
+
+                # Look back for sget-object (vault string) in previous 5 lines
+                vault_line_idx = None
+                vault_reg = None
+                for j in range(max(0, i-5), i):
+                    m = re.search(r'sget-object\s+(\w+),\s+(L\S+;->[\w]+:Ljava/lang/String;)', lines[j])
+                    if m:
+                        vault_line_idx = j
+                        vault_reg = m.group(1)
+                        break
+
+                if vault_line_idx is None:
+                    continue  # Uses const-string, not a vault string
+
+                # Look forward for check-cast to determine service type
+                service_name = None
+                for j in range(i+1, min(len(lines), i+10)):
+                    cm = re.search(r'check-cast\s+\w+,\s+(L\S+;)', lines[j])
+                    if cm:
+                        cast_type = cm.group(1)
+                        service_name = SERVICE_MAP.get(cast_type)
+                        if service_name:
+                            break
+
+                if service_name:
+                    # Replace the sget-object line with const-string
+                    old_line = lines[vault_line_idx]
+                    new_line = f'    const-string {vault_reg}, "{service_name}"\n'
+                    lines[vault_line_idx] = new_line
+                    modified = True
+                    patched += 1
+                    rel = os.path.relpath(fpath, decompiled)
+                    print(f"    {rel}:{vault_line_idx+1} -> \"{service_name}\"")
+
+            if modified:
+                with open(fpath, 'w') as f:
+                    f.writelines(lines)
+
+print(f"  Patched {patched} getSystemService vault strings")
+PYEOF
+export DECOMPILED
+
 # ############################################################################
 #
 #   PART 3: BUILD & DEPLOY
@@ -1702,7 +2096,7 @@ if [ -n "$PID" ]; then
         echo "$FLUTTER_LOG" | while read -r line; do echo "  $line"; done
     fi
 
-    SAFE_COUNT=$("$ADB" logcat -d --pid="$PID" 2>/dev/null | grep -c "SafeExceptionHandler" || echo 0)
+    SAFE_COUNT=$("$ADB" logcat -d --pid="$PID" 2>/dev/null | grep -c "SafeExceptionHandler" || true)
     if [ "$SAFE_COUNT" -gt 0 ]; then
         log "SafeExceptionHandler caught $SAFE_COUNT background exceptions (swallowed)"
     fi

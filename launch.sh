@@ -241,6 +241,9 @@ else
     fi
 
     if $NEED_RESTART; then
+        log "Saving emulator snapshot before proxy toggle..."
+        "$ADB" emu avd snapshot save default_boot &>/dev/null || true
+        sleep 3
         log "Restarting emulator to toggle proxy..."
         "$ADB" emu kill &>/dev/null || true
         sleep 5
@@ -331,13 +334,17 @@ else
     LAST_INSTALL=$(cat "$MARKER" 2>/dev/null || echo 0)
     INSTALLED=$("$ADB" shell pm list packages 2>/dev/null | grep -c "$PACKAGE" || echo 0)
 
-    if $OPT_REINSTALL || [ "$INSTALLED" -eq 0 ] || [ "$APK_MOD" -gt "$LAST_INSTALL" ]; then
-        if [ "$INSTALLED" -gt 0 ]; then
-            log "Uninstalling old version..."
-            "$ADB" shell pm uninstall "$PACKAGE" 2>/dev/null || true
-        fi
-        log "Installing patched APK..."
+    if $OPT_REINSTALL; then
+        log "Force reinstalling (app data will be cleared)..."
+        "$ADB" shell pm uninstall "$PACKAGE" 2>/dev/null || true
         "$ADB" install "$PATCHED_APK"
+    elif [ "$INSTALLED" -eq 0 ] || [ "$APK_MOD" -gt "$LAST_INSTALL" ]; then
+        log "Installing patched APK (preserving app data)..."
+        "$ADB" install -r "$PATCHED_APK" 2>/dev/null || {
+            warn "Replace install failed, doing clean install..."
+            "$ADB" shell pm uninstall "$PACKAGE" 2>/dev/null || true
+            "$ADB" install "$PATCHED_APK"
+        }
     else
         log "App already installed (use --reinstall to force)"
     fi
